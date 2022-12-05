@@ -1,5 +1,5 @@
 use std::{
-    io::{BufReader, Read, Write},
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     time::SystemTime,
 };
@@ -31,13 +31,14 @@ fn main() {
 #[allow(clippy::unused_io_amount)]
 fn handle_connection(mut stream: TcpStream) -> Result<()> {
     // Init connection
-    let mut buf_reader = BufReader::new(&mut stream);
     let mut init = [0; 64];
     let mut encrypted_init = [0; 8];
     let mut packet_len = [0; 1];
-    buf_reader.by_ref().take(56).read(&mut init)?;
-    buf_reader.read_exact(&mut encrypted_init)?;
-    buf_reader.read_exact(&mut packet_len)?;
+    std::io::Read::by_ref(&mut stream)
+        .take(56)
+        .read(&mut init)?;
+    stream.read_exact(&mut encrypted_init)?;
+    stream.read_exact(&mut packet_len)?;
     debug!("init: {:02x?}", init);
     debug!("encrypted_init: {:02x?}", encrypted_init);
     debug!("packet_len: {:02x?}", packet_len);
@@ -52,19 +53,19 @@ fn handle_connection(mut stream: TcpStream) -> Result<()> {
     debug!("decrypt_key: {:02x?}", decrypt_key);
     debug!("decrypt_iv: {:02x?}", decrypt_iv);
 
-    let mut cipher =
+    let mut decryptor =
         Aes256Ctr64Be::new(encrypt_key.as_slice().into(), encrypt_iv.as_slice().into());
-    cipher.apply_keystream(&mut init);
+    decryptor.apply_keystream(&mut init);
     debug!("init: {:02x?}", init);
 
     // ReqPqMulti
-    cipher.apply_keystream(&mut packet_len);
+    decryptor.apply_keystream(&mut packet_len);
     debug!("packet_len: {:02x?}", packet_len);
     let packet_len = packet_len[0] as usize * 4;
 
     let mut packet = vec![0; packet_len];
-    buf_reader.read(&mut packet)?;
-    cipher.apply_keystream(&mut packet);
+    stream.read(&mut packet)?;
+    decryptor.apply_keystream(&mut packet);
     debug!("packet: {:02x?}", packet);
 
     let mut cur = Cursor::from_slice(&packet);
@@ -89,6 +90,32 @@ fn handle_connection(mut stream: TcpStream) -> Result<()> {
     stream.write_all(&res_pq_mtproto)?;
 
     // ReqDHParams
+
+    let mut packet_len = [0; 1];
+    stream.read_exact(&mut packet_len)?;
+
+    decryptor.apply_keystream(&mut packet_len);
+    debug!("packet_len: {:02x?}", packet_len);
+    let packet_len = packet_len[0] as usize * 4;
+
+    let mut packet = vec![0; packet_len];
+    stream.read(&mut packet)?;
+    decryptor.apply_keystream(&mut packet);
+    debug!("packet: {:02x?}", packet);
+
+    // ResDHParams
+    let res_dh_params = ResDHParams::generate(req_pq_multi.nonce, Vec::new());
+    let mut res_dh_params_mtproto = BytesMut::new();
+    Abridged::new().pack(&res_dh_params.ser(), &mut res_dh_params_mtproto);
+    let _ = res_dh_params_mtproto.split_to(1);
+    debug!("res_dh_params: {:02x?}", res_dh_params);
+    debug!(
+        "res_dh_params_mtproto: {:02x?}",
+        res_dh_params_mtproto.to_vec()
+    );
+
+    encryptor.apply_keystream(&mut res_dh_params_mtproto);
+    stream.write_all(&res_dh_params_mtproto)?;
 
     // debug!("answer: {:02x?}", {
     //     let mut buf = Vec::new();
@@ -136,12 +163,9 @@ struct ResPq {
 impl ResPq {
     #[allow(overflowing_literals)]
     fn generate(nonce: [u8; 16], pq: Vec<u8>) -> Self {
-        ResPq {
+        Self {
             auth_key_id: 0,
-            message_id: (SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()) as i64,
+            message_id: time_now(),
             message_length: 0,
             magic: 0x05162463,
             nonce,
@@ -163,4 +187,48 @@ impl ResPq {
         self.server_public_key_fingerprints.serialize(&mut res);
         res
     }
+}
+
+#[derive(Debug)]
+struct ResDHParams {
+    auth_key_id: i64,
+    message_id: i64,
+    message_length: u32,
+    magic: u32,
+    nonce: [u8; 16],
+    server_nonce: [u8; 16],
+    encrypted_answer: Vec<u8>,
+}
+
+impl ResDHParams {
+    fn generate(nonce: [u8; 16], encrypted_answer: Vec<u8>) -> Self {
+        Self {
+            auth_key_id: 0,
+            message_id: time_now(),
+            message_length: 0,
+            magic: 0xd0e8075c,
+            nonce,
+            server_nonce: SERVER_NONCE,
+            encrypted_answer,
+        }
+    }
+
+    fn ser(&self) -> Vec<u8> {
+        let mut res = Vec::new();
+        self.auth_key_id.serialize(&mut res);
+        self.message_id.serialize(&mut res);
+        self.message_length.serialize(&mut res);
+        self.magic.serialize(&mut res);
+        self.nonce.serialize(&mut res);
+        self.server_nonce.serialize(&mut res);
+        self.encrypted_answer.serialize(&mut res);
+        res
+    }
+}
+
+fn time_now() -> i64 {
+    (SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()) as i64
 }
