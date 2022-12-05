@@ -1,7 +1,6 @@
 use std::{
     io::{BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    ops::Shr,
     time::SystemTime,
 };
 
@@ -9,10 +8,11 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 use anyhow::Result;
 use bytes::BytesMut;
 use grammers_mtproto::transport::{Abridged, Transport};
-use grammers_tl_types::{Cursor, Deserializable, RawVec, Serializable};
+use grammers_tl_types::{Cursor, Deserializable, Serializable};
 use log::{debug, error};
 
 type Aes256Ctr64Be = ctr::Ctr64BE<aes::Aes256>;
+const SERVER_NONCE: [u8; 16] = 0x1337u128.to_le_bytes();
 
 fn main() {
     pretty_env_logger::init();
@@ -30,6 +30,7 @@ fn main() {
 
 #[allow(clippy::unused_io_amount)]
 fn handle_connection(mut stream: TcpStream) -> Result<()> {
+    // Init connection
     let mut buf_reader = BufReader::new(&mut stream);
     let mut init = [0; 64];
     let mut encrypted_init = [0; 8];
@@ -56,6 +57,7 @@ fn handle_connection(mut stream: TcpStream) -> Result<()> {
     cipher.apply_keystream(&mut init);
     debug!("init: {:02x?}", init);
 
+    // ReqPqMulti
     cipher.apply_keystream(&mut packet_len);
     debug!("packet_len: {:02x?}", packet_len);
     let packet_len = packet_len[0] as usize * 4;
@@ -69,28 +71,35 @@ fn handle_connection(mut stream: TcpStream) -> Result<()> {
     let req_pq_multi = ReqPqMulti::parse(&mut cur)?;
     debug!("req_pq_multi: {:02x?}", req_pq_multi);
 
-    // let res_pq = ResPq::generate(req_pq_multi.nonce);
-    let res_pq = ResPq::generate([0; 16]);
+    // ResPq
+    let res_pq = ResPq::generate(
+        req_pq_multi.nonce,
+        0x17ED48941A08F981u64.to_le_bytes().into_iter().collect(),
+        // 0x0u64.to_le_bytes().into_iter().collect(), // SIGFPE
+    );
     let mut res_pq_mtproto = BytesMut::new();
     Abridged::new().pack(&res_pq.ser(), &mut res_pq_mtproto);
     let _ = res_pq_mtproto.split_to(1);
     debug!("res_pq: {:02x?}", res_pq);
-    debug!("res_pq_mtproto: {:02x?}", res_pq_mtproto);
+    debug!("res_pq_mtproto: {:02x?}", res_pq_mtproto.to_vec());
 
     let mut encryptor =
         Aes256Ctr64Be::new(decrypt_key.as_slice().into(), decrypt_iv.as_slice().into());
     encryptor.apply_keystream(&mut res_pq_mtproto);
     stream.write_all(&res_pq_mtproto)?;
 
-    debug!("answer: {:02x?}", {
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf)?;
-        buf
-    });
+    // ReqDHParams
+
+    // debug!("answer: {:02x?}", {
+    //     let mut buf = Vec::new();
+    //     stream.read_to_end(&mut buf)?;
+    //     buf
+    // });
 
     Ok(())
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ReqPqMulti {
     auth_key_id: i64,
@@ -126,7 +135,7 @@ struct ResPq {
 
 impl ResPq {
     #[allow(overflowing_literals)]
-    fn generate(nonce: [u8; 16]) -> Self {
+    fn generate(nonce: [u8; 16], pq: Vec<u8>) -> Self {
         ResPq {
             auth_key_id: 0,
             message_id: (SystemTime::now()
@@ -136,8 +145,8 @@ impl ResPq {
             message_length: 0,
             magic: 0x05162463,
             nonce,
-            server_nonce: 0x1337u128.to_le_bytes(),
-            pq: 0x17ED48941A08F981u64.to_le_bytes().into_iter().collect(),
+            server_nonce: SERVER_NONCE,
+            pq,
             server_public_key_fingerprints: vec![0xd09d1d85de64fd85],
         }
     }
